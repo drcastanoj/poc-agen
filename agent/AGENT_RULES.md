@@ -13,8 +13,13 @@ instead of guessing.
 - Do not add new dependencies. If the task appears to require one, stop and
   report that instead.
 - Do not delete or skip existing tests to make a suite pass. If a test fails
-  because your change is wrong, fix your change. If it fails for an unrelated
-  reason, report it and stop.
+  because your change is wrong, fix your change.
+- If a test fails for a reason unrelated to your change (a pre-existing bug,
+  a broken config), you may fix the minimum needed to unblock validation —
+  a config value, an import path, one line — as long as it does not change
+  the behavior the test is actually asserting. Note it plainly in your final
+  summary as a separate, pre-existing fix. If the fix would require touching
+  business logic or you are unsure it is safe, report it and stop instead.
 - Never use `test.todo`, `it.skip`, `xit`, or equivalent to sidestep a failure.
 
 ## Git
@@ -27,14 +32,9 @@ instead of guessing.
 
 ## Validation
 
-Run these yourself and iterate until all four exit zero:
-
-```
-pnpm lint
-pnpm exec tsc --noEmit
-pnpm test
-pnpm build
-```
+The task message gives you four exact commands (lint, typecheck, test, build)
+for this repo's actual package manager. Run them yourself and iterate until
+all four exit zero.
 
 The harness re-runs all four independently after you finish. Reporting success
 without actually running them wastes the entire run.
