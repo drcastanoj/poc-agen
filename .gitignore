@@ -1,0 +1,5 @@
+.DS_Store
+.env
+*.pem
+agent/logs/
+node_modules

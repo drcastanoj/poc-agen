@@ -16,8 +16,8 @@
 # AWS credentials come from the instance role via the default SDK chain.
 #
 # Optional env:
-#   GITHUB_ORG          default: letsdeel
-#   BASE_BRANCH         default: dev
+#   GITHUB_ORG          default: drcastanoj
+#   BASE_BRANCH         default: main
 #   MAX_TURNS           model round trips, default: 40
 #   DRY_RUN             set to 1 to stop before push/PR
 
@@ -27,8 +27,8 @@ REPO="${1:?usage: run-agent.sh <repo> <TICKET> \"<task>\"}"
 TICKET="${2:?usage: run-agent.sh <repo> <TICKET> \"<task>\"}"
 TASK="${3:?usage: run-agent.sh <repo> <TICKET> \"<task>\"}"
 
-GITHUB_ORG="${GITHUB_ORG:-letsdeel}"
-BASE_BRANCH="${BASE_BRANCH:-dev}"
+GITHUB_ORG="${GITHUB_ORG:-drcastanoj}"
+BASE_BRANCH="${BASE_BRANCH:-main}"
 MAX_TURNS="${MAX_TURNS:-40}"
 DRY_RUN="${DRY_RUN:-0}"
 
