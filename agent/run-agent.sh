@@ -20,6 +20,10 @@
 #   BASE_BRANCH         default: main
 #   MAX_TURNS           model round trips, default: 40
 #   DRY_RUN             set to 1 to stop before push/PR
+#   LINT_CMD, TYPECHECK_CMD, TEST_CMD, BUILD_CMD
+#                       override the validation gate commands. Defaults are
+#                       derived from the target repo's lockfile (pnpm / yarn /
+#                       npm) and package.json scripts.
 
 set -euo pipefail
 
@@ -65,9 +69,36 @@ git config user.email "${GIT_AUTHOR_EMAIL:-akai-agent@deel.com}"
 git checkout -b "$BRANCH"
 
 # --- 2. install --------------------------------------------------------------
-log "installing dependencies"
-if [ -d /pnpm-store ]; then pnpm config set store-dir /pnpm-store; fi
-pnpm install --frozen-lockfile 2>&1 | tee "$LOGS/install.log"
+# Detect the package manager from the target repo's lockfile rather than
+# assuming pnpm, so this runner works against any repo, not just Deel's.
+if [ -f pnpm-lock.yaml ]; then
+  PKG_RUN="pnpm"
+  INSTALL_CMD="pnpm install --frozen-lockfile"
+  if [ -d /pnpm-store ]; then pnpm config set store-dir /pnpm-store; fi
+elif [ -f package-lock.json ]; then
+  PKG_RUN="npm run"
+  INSTALL_CMD="npm ci"
+elif [ -f yarn.lock ]; then
+  PKG_RUN="yarn"
+  INSTALL_CMD="yarn install --frozen-lockfile"
+else
+  PKG_RUN="npm run"
+  INSTALL_CMD="npm install"
+fi
+
+LINT_CMD="${LINT_CMD:-$PKG_RUN lint}"
+TEST_CMD="${TEST_CMD:-$PKG_RUN test}"
+BUILD_CMD="${BUILD_CMD:-$PKG_RUN build}"
+if [ -z "${TYPECHECK_CMD:-}" ]; then
+  if node -e "process.exit(require('./package.json').scripts.typecheck ? 0 : 1)" 2>/dev/null; then
+    TYPECHECK_CMD="$PKG_RUN typecheck"
+  else
+    TYPECHECK_CMD="npx tsc --noEmit"
+  fi
+fi
+
+log "package manager: $PKG_RUN"
+eval "$INSTALL_CMD" 2>&1 | tee "$LOGS/install.log"
 
 # --- 3. agent loop -----------------------------------------------------------
 # The agent iterates on its own: edit, run lint/test, read the failure, fix.
@@ -83,10 +114,10 @@ Branch: ${BRANCH} (already created from ${BASE_BRANCH}; you are on it)
 Implement this change. After editing, run the validation commands yourself and
 keep iterating until every one of them exits zero:
 
-  pnpm lint
-  pnpm exec tsc --noEmit
-  pnpm test
-  pnpm build
+  ${LINT_CMD}
+  ${TYPECHECK_CMD}
+  ${TEST_CMD}
+  ${BUILD_CMD}
 
 Do not commit, push, or open a pull request — the harness handles that.
 Do not modify CI configuration, lockfiles, or unrelated files.
@@ -124,10 +155,10 @@ log "validating"
 : > "$LOGS/validation.log"
 FAILED=""
 for step in \
-  "lint:pnpm lint" \
-  "typecheck:pnpm exec tsc --noEmit" \
-  "test:pnpm test" \
-  "build:pnpm build"
+  "lint:${LINT_CMD}" \
+  "typecheck:${TYPECHECK_CMD}" \
+  "test:${TEST_CMD}" \
+  "build:${BUILD_CMD}"
 do
   name="${step%%:*}"; cmd="${step#*:}"
   printf '\n----- %s -----\n' "$name" >> "$LOGS/validation.log"
@@ -174,10 +205,10 @@ All checks run in an isolated sandbox before this PR was opened:
 
 | Check | Result |
 |---|---|
-| \`pnpm lint\` | pass |
-| \`pnpm exec tsc --noEmit\` | pass |
-| \`pnpm test\` | pass |
-| \`pnpm build\` | pass |
+| \`${LINT_CMD}\` | pass |
+| \`${TYPECHECK_CMD}\` | pass |
+| \`${TEST_CMD}\` | pass |
+| \`${BUILD_CMD}\` | pass |
 
 ## Notes
 
