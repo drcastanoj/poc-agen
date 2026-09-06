@@ -9,7 +9,6 @@ services:
       # via the default AWS SDK chain — no keys in this file.
       BEDROCK_MODEL_ID: ${BEDROCK_MODEL_ID:?set BEDROCK_MODEL_ID}
       AWS_REGION: ${AWS_REGION:-us-east-1}
-      AWS_CONTAINER_CREDENTIALS_FULL_URI: ${AWS_CONTAINER_CREDENTIALS_FULL_URI:-}
       GH_TOKEN: ${GH_TOKEN:?set GH_TOKEN}
       GITHUB_ORG: ${GITHUB_ORG:?set GITHUB_ORG}
       BASE_BRANCH: ${BASE_BRANCH:-main}
