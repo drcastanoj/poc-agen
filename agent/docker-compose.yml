@@ -1,0 +1,58 @@
+services:
+  agent:
+    build:
+      context: .
+      args:
+        PNPM_VERSION: "10.28.2"
+    environment:
+      # Bedrock: model + region. Credentials come from the EC2 instance role
+      # via the default AWS SDK chain — no keys in this file.
+      BEDROCK_MODEL_ID: ${BEDROCK_MODEL_ID:?set BEDROCK_MODEL_ID}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_CONTAINER_CREDENTIALS_FULL_URI: ${AWS_CONTAINER_CREDENTIALS_FULL_URI:-}
+      GH_TOKEN: ${GH_TOKEN:?set GH_TOKEN}
+      GITHUB_ORG: ${GITHUB_ORG:?set GITHUB_ORG}
+      BASE_BRANCH: ${BASE_BRANCH:-main}
+      MAX_TURNS: ${MAX_TURNS:-40}
+      MAX_TOKENS_TOTAL: ${MAX_TOKENS_TOTAL:-2000000}
+      DRY_RUN: ${DRY_RUN:-0}
+      # Point the repo's tests at the sidecars below. Adjust the variable names
+      # to whatever the target repo actually reads.
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/app_test
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - pnpm-store:/pnpm-store
+      - ./logs:/work/logs
+    # Reach the EC2 instance metadata service for the instance role.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pnpm-store:

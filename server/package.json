@@ -1,0 +1,16 @@
+{
+  "name": "coder-agent-poc-console",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Demo console for the coder agent POC: starts runs and streams logs",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
