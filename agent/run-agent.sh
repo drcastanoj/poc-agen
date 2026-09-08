@@ -78,13 +78,33 @@ printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > "$HOME/.git-creden
 umask 022
 
 # --- derive a Deel-convention branch name -----------------------------------
+# `sed`/`cut` work line by line: a task with embedded newlines (a pasted
+# checklist, "fail-lint\npass-test\n...") would otherwise sail through with
+# each line separately sedded and the newlines between them left intact,
+# producing a "slug" that is itself multi-line — which git then rejects as a
+# branch name with a bare `fatal:` and no indication why. `tr -s '[:space:]'
+# ' '` collapses all whitespace, including newlines and tabs, to single
+# spaces first, so everything below always sees one line.
 slug=$(printf '%s' "$TASK" \
+  | tr -s '[:space:]' ' ' \
   | tr '[:upper:]' '[:lower:]' \
   | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' \
   | cut -c1-40 | sed -E 's/-+$//')
 BRANCH="${TICKET}-${slug}"
 
-log "run $RUN_ID | repo=$REPO base=$BASE_BRANCH"
+# Belt and suspenders: validate the branch name itself rather than letting a
+# malformed one reach `git switch -c` as an opaque git error. If it's somehow
+# still invalid (empty slug, a ticket id with characters git disallows in
+# refs), fall back to a short, deterministic, always-valid name and say so
+# plainly — repo, attempted name, and what's being used instead — so a failure
+# here is something you can read at a glance, not a fatal to go dig through.
+if ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
+  SAFE_BRANCH="${TICKET//[^A-Za-z0-9-]/-}-run-${RUN_ID##*-}"
+  log "invalid branch name for repo=$REPO: '$BRANCH' — using '$SAFE_BRANCH' instead"
+  BRANCH="$SAFE_BRANCH"
+fi
+
+log "run $RUN_ID | repo=$REPO base=$BASE_BRANCH branch=$BRANCH"
 
 # --- 1. checkout -------------------------------------------------------------
 # Every git operation that touches shared state in the mirror — creating it,
@@ -133,9 +153,15 @@ if git -C "$MIRROR" show-ref --verify --quiet "refs/heads/${BRANCH}" \
   log "branch name taken — using $BRANCH"
 fi
 
-git -C "$MIRROR" worktree add --quiet --detach "$WORK" "refs/remotes/origin/${BASE_BRANCH}"
+if ! git -C "$MIRROR" worktree add --quiet --detach "$WORK" "refs/remotes/origin/${BASE_BRANCH}"; then
+  log "could not create worktree for repo=$REPO at $WORK (base=$BASE_BRANCH) — see git output above"
+  exit 1
+fi
 cd "$WORK"
-git switch --quiet -c "$BRANCH"
+if ! git switch --quiet -c "$BRANCH"; then
+  log "could not create branch '$BRANCH' for repo=$REPO in $WORK — see git output above"
+  exit 1
+fi
 
 flock -u 9
 

@@ -1,5 +1,6 @@
 services:
   agent:
+    image: poc-agent:latest
     build:
       context: .
       args:
