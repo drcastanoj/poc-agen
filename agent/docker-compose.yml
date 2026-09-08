@@ -15,6 +15,12 @@ services:
       MAX_TURNS: ${MAX_TURNS:-40}
       MAX_TOKENS_TOTAL: ${MAX_TOKENS_TOTAL:-2000000}
       DRY_RUN: ${DRY_RUN:-0}
+      # Unique per run: names the worktree and the log directory. The console
+      # passes its own run id; the runner falls back to timestamp+pid.
+      RUN_ID: ${RUN_ID:-}
+      CACHE_ROOT: /cache
+      KEEP_WORKTREE: ${KEEP_WORKTREE:-0}
+      LOCK_TIMEOUT: ${LOCK_TIMEOUT:-900}
       # Point the repo's tests at the sidecars below. Adjust the variable names
       # to whatever the target repo actually reads.
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/app_test
@@ -25,8 +31,14 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - pnpm-store:/pnpm-store
-      - ./logs:/work/logs
+      # Host directories, not named volumes: `docker compose -p <run-id>` gives
+      # each run its own project namespace (so parallel runs get their own
+      # Postgres and Redis), and a named volume would be namespaced along with
+      # it — one cache per run, which is the opposite of the point. Bind mounts
+      # are project-independent, so every run shares one mirror cache and one
+      # pnpm store.
+      - ${POC_CACHE_DIR:-../cache}:/cache
+      - ${POC_LOGS_DIR:-./logs}:/work/logs
     # Reach the EC2 instance metadata service for the instance role.
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -52,6 +64,3 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
-
-volumes:
-  pnpm-store:

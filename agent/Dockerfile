@@ -1,7 +1,7 @@
 FROM node:20-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git curl ca-certificates jq gnupg python3 python3-pip \
+      git curl ca-certificates jq gnupg python3 python3-pip util-linux \
   && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
        -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
   && echo "deb [signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \
@@ -17,9 +17,10 @@ RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
 COPY requirements.txt /opt/akai/requirements.txt
 RUN pip3 install --no-cache-dir --break-system-packages -r /opt/akai/requirements.txt
 
-# Shared pnpm store — mount a volume here so installs are warm across runs.
-RUN mkdir -p /pnpm-store /work
-ENV PNPM_HOME=/pnpm-store
+# /cache is the shared, persistent host directory: bare mirrors, per-run
+# worktrees, per-repo locks and the pnpm store all live under it.
+RUN mkdir -p /cache /work
+ENV PNPM_HOME=/pnpm-home
 
 WORKDIR /work
 COPY run-agent.sh agent.py AGENT_RULES.md /opt/akai/

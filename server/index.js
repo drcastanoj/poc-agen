@@ -8,23 +8,37 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 const AGENT_DIR = process.env.AGENT_DIR || path.join(__dirname, '..', 'agent');
+const CACHE_DIR = process.env.POC_CACHE_DIR || path.join(__dirname, '..', 'cache');
 const CHECKS = ['lint', 'typecheck', 'test', 'build'];
+
+// How many agent containers may run at once. Each one is a full install plus a
+// test suite plus its own Postgres and Redis, so the ceiling is the box, not
+// the design: ~2 on a t3.xlarge, more if you size up. Runs beyond it queue.
+const MAX_CONCURRENT = Math.max(1, Number(process.env.MAX_CONCURRENT || 2));
+
+// The plugin form on the instance; override to `docker-compose` on a machine
+// that only has the standalone binary.
+const COMPOSE = (process.env.DOCKER_COMPOSE || 'docker compose').split(/\s+/);
+const [COMPOSE_BIN, ...COMPOSE_ARGS] = COMPOSE;
 
 // In-memory only. Restarting the server loses history — fine for a POC,
 // and an honest thing to say out loud during the demo.
 const runs = new Map();
+const queue = [];
+let active = 0;
 
 function newRun({ repo, ticket, task }) {
   const id = crypto.randomBytes(4).toString('hex');
   const run = {
     id, repo, ticket, task,
-    state: 'starting',
-    phase: 'starting up',
+    state: 'queued',
+    phase: 'queued',
     checks: Object.fromEntries(CHECKS.map((c) => [c, 'pending'])),
     prUrl: null,
     lines: [],
     subscribers: new Set(),
-    startedAt: Date.now(),
+    createdAt: Date.now(),
+    startedAt: null,
     endedAt: null,
   };
   runs.set(id, run);
@@ -38,8 +52,12 @@ function emit(run, event) {
 }
 
 function snapshot(run) {
-  const { id, repo, ticket, task, state, phase, checks, prUrl, startedAt, endedAt } = run;
-  return { id, repo, ticket, task, state, phase, checks, prUrl, startedAt, endedAt };
+  const { id, repo, ticket, task, state, phase, checks, prUrl, createdAt, startedAt, endedAt } = run;
+  const queuePosition = state === 'queued' ? queue.indexOf(run) + 1 : 0;
+  return {
+    id, repo, ticket, task, state, phase, checks, prUrl,
+    createdAt, startedAt, endedAt, queuePosition,
+  };
 }
 
 // Read the runner's own output to drive the UI. The runner prints
@@ -73,14 +91,31 @@ function ingest(run, raw) {
   }
 }
 
+// One compose project per run. Without this, parallel runs would share a single
+// `agent` project and therefore a single Postgres and Redis — two test suites
+// truncating each other's tables. `-p` gives each run its own sidecars; the
+// caches stay shared because they are bind mounts, not project-scoped volumes.
+function project(run) {
+  return `poc-${run.id}`;
+}
+
 function start(run) {
+  run.state = 'starting';
+  run.phase = 'starting up';
+  run.startedAt = Date.now();
+  active += 1;
+  emit(run, { type: 'state', run: snapshot(run) });
+
   const args = [
-    'compose', 'run', '--rm', '--no-TTY', 'agent',
+    ...COMPOSE_ARGS, '-p', project(run), 'run', '--rm', '--no-TTY', 'agent',
     run.repo, run.ticket, run.task,
   ];
-  const child = spawn('docker', args, {
+  const child = spawn(COMPOSE_BIN, args, {
     cwd: AGENT_DIR,
-    env: process.env,
+    // RUN_ID names this run's worktree and log directory inside the shared
+    // cache; it has to be unique per concurrent run, so it is the run id
+    // rather than the runner's timestamp fallback.
+    env: { ...process.env, RUN_ID: run.id, POC_CACHE_DIR: CACHE_DIR },
   });
 
   let stdoutRest = '';
@@ -98,9 +133,6 @@ function start(run) {
   child.on('error', (err) => {
     ingest(run, `harness error: ${err.message}`);
     run.state = 'error';
-    run.endedAt = Date.now();
-    emit(run, { type: 'state', run: snapshot(run) });
-    emit(run, { type: 'done' });
   });
 
   child.on('close', (code) => {
@@ -113,6 +145,36 @@ function start(run) {
     run.endedAt = Date.now();
     emit(run, { type: 'state', run: snapshot(run) });
     emit(run, { type: 'done' });
+    finish(run);
+  });
+}
+
+// `compose run` removes the agent container but leaves this project's Postgres
+// and Redis behind. Without a teardown they accumulate one pair per run until
+// the box runs out of memory.
+function finish(run) {
+  active = Math.max(0, active - 1);
+  const down = spawn(COMPOSE_BIN, [...COMPOSE_ARGS, '-p', project(run), 'down', '-v', '--remove-orphans'], {
+    cwd: AGENT_DIR,
+    env: { ...process.env, POC_CACHE_DIR: CACHE_DIR },
+    stdio: 'ignore',
+  });
+  down.on('error', () => {});
+  drainQueue();
+}
+
+// Starts what fits, then re-labels whoever is still waiting — queue positions
+// shift every time a slot frees up, and the console shows `phase` verbatim.
+function drainQueue() {
+  while (active < MAX_CONCURRENT && queue.length > 0) {
+    start(queue.shift());
+  }
+  queue.forEach((run, i) => {
+    const phase = `queued — position ${i + 1} (${MAX_CONCURRENT} running)`;
+    if (run.phase !== phase) {
+      run.phase = phase;
+      emit(run, { type: 'state', run: snapshot(run) });
+    }
   });
 }
 
@@ -122,12 +184,24 @@ app.post('/api/runs', (req, res) => {
     return res.status(400).json({ error: 'repo, ticket and task are all required' });
   }
   const run = newRun({ repo: repo.trim(), ticket: ticket.trim(), task: task.trim() });
-  start(run);
+  queue.push(run);
+  drainQueue();
   res.json(snapshot(run));
 });
 
 app.get('/api/runs', (_req, res) => {
-  res.json([...runs.values()].sort((a, b) => b.startedAt - a.startedAt).map(snapshot));
+  res.json([...runs.values()].sort((a, b) => b.createdAt - a.createdAt).map(snapshot));
+});
+
+app.get('/api/capacity', (_req, res) => {
+  res.json({ maxConcurrent: MAX_CONCURRENT, active, queued: queue.length });
+});
+
+// Plain text, for grepping a finished run from a script.
+app.get('/api/runs/:id/log', (req, res) => {
+  const run = runs.get(req.params.id);
+  if (!run) return res.status(404).end();
+  res.type('text/plain').send(run.lines.join('\n'));
 });
 
 app.get('/api/runs/:id/stream', (req, res) => {
@@ -157,4 +231,6 @@ app.get('/api/runs/:id/stream', (req, res) => {
 });
 
 const port = process.env.PORT || 8080;
-app.listen(port, () => console.log(`console on :${port} (agent dir ${AGENT_DIR})`));
+app.listen(port, () => console.log(
+  `console on :${port} (agent dir ${AGENT_DIR}, cache ${CACHE_DIR}, ${MAX_CONCURRENT} concurrent)`,
+));
