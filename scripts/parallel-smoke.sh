@@ -94,10 +94,15 @@ all_log=$(for id in "${ids[@]}"; do curl -fsS "$CONSOLE/api/runs/$id/log"; echo;
 echo
 echo "--- cache: expect exactly one mirror clone per repo ---"
 for repo in "$REPO_A" "$REPO_B"; do
-  # The runner wraps its markers as `=== cache miss — org/repo ===`, so the
-  # repo name is mid-line, not at the end.
-  misses=$(grep -cE "cache miss — [^ ]+/${repo}( |\$)" <<<"$all_log" || true)
-  hits=$(grep -cE "cache hit — [^ ]+/${repo}( |\$)" <<<"$all_log" || true)
+  # The runner's cache-hit/cache-miss lines put a word or two ("mirroring",
+  # "fetching", "seeding ... from s3://...") between the marker and the
+  # org/repo — never immediately adjacent — so the pattern needs `.*` there,
+  # not `[^ ]+`. (A stricter `[^ ]+` here never matched any real log line,
+  # including on the EC2 path — it always reported zero clones and zero
+  # fetches regardless of what actually happened. Confirmed by hand against
+  # agent/run-agent.sh and agent/lib/cache.sh's real messages before fixing.)
+  misses=$(grep -cE "cache miss —.* [^ ]*/${repo}([. ]|\$)" <<<"$all_log" || true)
+  hits=$(grep -cE "cache hit —.* [^ ]*/${repo}([. ]|\$)" <<<"$all_log" || true)
   status=$([ "$misses" -le 1 ] && echo ok || echo "SUSPECT")
   printf '  %-16s %s clone(s), %s fetch(es)  [%s]\n' "$repo" "$misses" "$hits" "$status"
 done

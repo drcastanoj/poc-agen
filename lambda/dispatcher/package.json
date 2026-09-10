@@ -1,0 +1,12 @@
+{
+  "name": "poc-agent-lambda-dispatcher",
+  "private": true,
+  "version": "0.1.0",
+  "description": "SQS-triggered: launches the Fargate task for one queued run. See docs/lambda-migration.md.",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-ecs": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0"
+  }
+}

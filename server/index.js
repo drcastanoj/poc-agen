@@ -193,6 +193,16 @@ app.get('/api/runs', (_req, res) => {
   res.json([...runs.values()].sort((a, b) => b.createdAt - a.createdAt).map(snapshot));
 });
 
+// The console now polls this instead of relying solely on the SSE stream
+// below, so the same frontend (server/public/index.html) works unchanged
+// against lambda/api, which has no long-lived process to stream from. The
+// stream route stays for anyone tailing it by hand.
+app.get('/api/runs/:id', (req, res) => {
+  const run = runs.get(req.params.id);
+  if (!run) return res.status(404).json({ error: 'not found' });
+  res.json(snapshot(run));
+});
+
 app.get('/api/capacity', (_req, res) => {
   res.json({ maxConcurrent: MAX_CONCURRENT, active, queued: queue.length });
 });

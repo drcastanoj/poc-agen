@@ -1,5 +1,8 @@
 services:
   agent:
+    # Pinned explicitly. Compose otherwise names a built image after the project,
+    # and the project is per-run (`-p poc-<run-id>`), so every run would build
+    # and store its own copy. One tag means one image, built once, shared by all.
     image: poc-agent:latest
     build:
       context: .

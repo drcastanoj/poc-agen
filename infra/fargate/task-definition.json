@@ -1,0 +1,99 @@
+{
+  "family": "poc-agent-run",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "4096",
+  "memory": "16384",
+  "ephemeralStorage": { "sizeInGiB": 40 },
+  "executionRoleArn": "REPLACE_WITH_EXECUTION_ROLE_ARN",
+  "taskRoleArn": "REPLACE_WITH_TASK_ROLE_ARN",
+  "runtimePlatform": { "cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX" },
+  "containerDefinitions": [
+    {
+      "name": "agent",
+      "image": "REPLACE_WITH_ECR_IMAGE_URI",
+      "essential": true,
+      "dependsOn": [
+        { "containerName": "postgres", "condition": "HEALTHY" },
+        { "containerName": "redis", "condition": "HEALTHY" }
+      ],
+      "environment": [
+        { "name": "AWS_REGION", "value": "us-east-1" },
+        { "name": "BEDROCK_MODEL_ID", "value": "REPLACE_WITH_MODEL_ID" },
+        { "name": "GITHUB_ORG", "value": "drcastanoj" },
+        { "name": "BASE_BRANCH", "value": "main" },
+        { "name": "MAX_TURNS", "value": "40" },
+        { "name": "MAX_TOKENS_TOTAL", "value": "2000000" },
+        { "name": "CACHE_ROOT", "value": "/cache" },
+        { "name": "CACHE_BACKEND", "value": "s3" },
+        { "name": "CACHE_BUCKET", "value": "REPLACE_WITH_CACHE_BUCKET" },
+        { "name": "LOCK_BACKEND", "value": "dynamodb" },
+        { "name": "LOCK_TABLE", "value": "poc-agent-locks" },
+        { "name": "LOCK_TIMEOUT", "value": "300" },
+        { "name": "RUN_TABLE", "value": "poc-agent-runs" },
+        { "name": "PUBLISH_MODE", "value": "deferred" },
+        { "name": "DATABASE_URL", "value": "postgres://postgres:postgres@localhost:5432/app_test" },
+        { "name": "REDIS_URL", "value": "redis://localhost:6379" }
+      ],
+      "secrets": [
+        {
+          "name": "GH_TOKEN",
+          "valueFrom": "arn:aws:ssm:us-east-1:REPLACE_WITH_ACCOUNT_ID:parameter/poc/github-token-read"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/poc-agent-run",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "agent"
+        }
+      }
+    },
+    {
+      "name": "postgres",
+      "image": "postgres:16-alpine",
+      "essential": false,
+      "environment": [
+        { "name": "POSTGRES_USER", "value": "postgres" },
+        { "name": "POSTGRES_PASSWORD", "value": "postgres" },
+        { "name": "POSTGRES_DB", "value": "app_test" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "pg_isready -U postgres"],
+        "interval": 2,
+        "timeout": 3,
+        "retries": 20,
+        "startPeriod": 5
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/poc-agent-run",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "postgres"
+        }
+      }
+    },
+    {
+      "name": "redis",
+      "image": "redis:7-alpine",
+      "essential": false,
+      "healthCheck": {
+        "command": ["CMD", "redis-cli", "ping"],
+        "interval": 2,
+        "timeout": 3,
+        "retries": 20,
+        "startPeriod": 5
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/poc-agent-run",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "redis"
+        }
+      }
+    }
+  ]
+}

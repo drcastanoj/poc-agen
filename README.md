@@ -4,25 +4,51 @@ An AI agent that implements a change in a real repository, verifies it in an
 isolated container, and opens a pull request. Inference runs through Bedrock, so
 nothing leaves your AWS account.
 
-One EC2 instance. No Kubernetes, no CI service, no control plane.
+Two ways to run it — the code is shared between them (`run-agent.sh` and
+`agent.py` are the same either way):
+
+- **One EC2 instance.** No Kubernetes, no CI service, no control plane. Steps
+  1–7 below.
+- **Serverless — Lambda control plane, Fargate worker, no EC2.** Zero idle
+  cost, no box to patch, and the guardrail that stops the agent from pushing
+  becomes an IAM boundary instead of a string blocklist. See
+  [Serverless path](#serverless-path-lambda--fargate-no-ec2) and
+  [`docs/lambda-migration.md`](docs/lambda-migration.md) for the full design
+  and cost comparison. This is the recommended path for anything beyond a
+  one-afternoon demo.
 
 ```
 agent/
   agent.py            the Bedrock Converse tool-use loop
   run-agent.sh        clone, install, agent, validation gate, PR
   AGENT_RULES.md      operating constraints for the agent
-  Dockerfile          Node 20 + pnpm + python/boto3 + gh
-  docker-compose.yml  agent + Postgres + Redis sidecars
+  Dockerfile          Node 20 + pnpm + python/boto3 + gh + aws cli + zstd
+  docker-compose.yml  agent + Postgres + Redis sidecars (EC2 path)
+  lib/
+    cache.sh          repo mirror + deps cache: fs (EC2) | s3 (serverless)
+    lock.sh           per-repo lock: flock (EC2) | dynamodb (serverless)
+    report.sh         coarse run state -> DynamoDB, for the serverless console
   requirements.txt
 server/
-  index.js            demo console: queues runs, streams logs
-  public/index.html
+  index.js            demo console: queues runs, streams logs (EC2 path)
+  public/index.html    same page serves both paths — see config.js
 infra/
   ec2-userdata.sh
   instance-role-policy.json
+  fargate/            serverless path — see docs/lambda-migration.md
+    setup.sh           provisions everything: S3, DynamoDB, SQS, IAM, ECS,
+                        Lambda, API Gateway, EventBridge, the console
+    task-definition.json
+    build-images.sh, build-lambda-zips.sh, deploy-console.sh
+    iam/               one narrow policy per role — see §4.6 step 11
+lambda/                serverless path
+  api/                 API Gateway handler: enqueue + poll run state/logs
+  dispatcher/          SQS -> ecs:RunTask
+  publish/             the only component holding a GitHub write token —
+                        container-image Lambda (needs real git + gh)
 scripts/
   parallel-smoke.sh   fires a matrix of runs at the console at once
-cache/                persistent, gitignored (created on the instance)
+cache/                persistent, gitignored (created on the instance; EC2 path)
   repos/<org>/<repo>.git    bare mirror, cloned once per repo
   worktrees/<repo>/<run>    one checkout per run
   locks/<org>__<repo>.lock  per-repo git lock
@@ -285,6 +311,232 @@ Open the tunnelled `http://localhost:8080`. The left rail shows the four
 validation checks flipping from *not run* to *pass* or *fail*; the PR link
 appears only when all four pass.
 
+## Serverless path (Lambda + Fargate, no EC2)
+
+Full design, the two options considered, and a cost comparison are in
+[`docs/lambda-migration.md`](docs/lambda-migration.md). This section is just
+"how to stand it up."
+
+**What's different from the EC2 path**, concretely:
+
+| | EC2 path | Serverless path |
+|---|---|---|
+| Compute | `docker compose run` on one instance | `ecs:RunTask` on Fargate (`infra/fargate/task-definition.json` — same three containers as `docker-compose.yml`: agent, postgres, redis) |
+| Repo mirror + deps cache | bind-mounted `cache/` | S3 (`agent/lib/cache.sh`, `CACHE_BACKEND=s3`) |
+| Per-repo lock | `flock` on that same mount | DynamoDB conditional writes with a TTL (`agent/lib/lock.sh`, `LOCK_BACKEND=dynamodb`) |
+| Commit + push + PR | `run-agent.sh` does it inline | `run-agent.sh` stops after validation and hands a patch to S3 (`PUBLISH_MODE=deferred`); a separate Lambda (`lambda/publish`) applies it and opens the PR |
+| Console | Express + SSE, systemd | static page (`deploy-console.sh`) polling `lambda/api`, which is stateless |
+| The guardrail against a stray push | `DENIED` list in `agent.py` only | that list, **plus** the Fargate task's IAM role has no credential that can write to GitHub at all — see §4.6 step 11 of the migration doc |
+
+Everything in `agent/agent.py` — the tool loop, the token/turn ceilings, the
+`safe_path()` confinement — is unchanged. `run-agent.sh` is the same script
+too; the serverless-only behavior is switched on entirely by environment
+variables (`CACHE_BACKEND`, `LOCK_BACKEND`, `PUBLISH_MODE`), which default to
+today's EC2 behavior when unset.
+
+### Setup
+
+Prerequisites: Docker running locally, `aws`/`node`/`npm`/`zip`/`jq` on
+`PATH`, and credentials with room to create IAM roles, ECS/Lambda/API
+Gateway/EventBridge resources.
+
+```bash
+export BEDROCK_MODEL_ID=<id from Step 1 above>
+export GITHUB_ORG=drcastanoj
+cd infra/fargate
+./setup.sh
+```
+
+This provisions, in order: the S3 cache bucket, the two DynamoDB tables, an
+SQS queue, five narrowly-scoped IAM roles (one per component — see `iam/`),
+a public subnet + no-inbound security group (no NAT gateway — see the
+migration doc §7.4 on why that's a deliberate $33/mo saved, not an oversight),
+builds and pushes both container images, an ECS cluster and the task
+definition, the two zip-based Lambdas plus the container-image publish
+Lambda, the SQS-to-dispatcher wiring, an API Gateway HTTP API, the
+EventBridge rule that fires `lambda/publish` when an agent task stops, and
+the static console.
+
+It does **not** create your GitHub tokens — same reasoning as Step 2 above,
+sharpened by the split itself:
+
+```bash
+aws ssm put-parameter --name /poc/github-token-read --type SecureString \
+  --value "github_pat_..." --region us-east-1
+  # Contents:read only. This is the one the Fargate task's role can reach.
+
+aws ssm put-parameter --name /poc/github-token-write --type SecureString \
+  --value "github_pat_..." --region us-east-1
+  # Contents:write + Pull requests:write. Only lambda/publish's role can
+  # reach this parameter — see infra/fargate/iam/publish-role-policy.json.
+```
+
+Two fine-grained PATs on the same demo repo, differing only in scope, is the
+whole point: even if `PUBLISH_MODE` were somehow set wrong, the Fargate
+task's credential physically cannot push.
+
+`setup.sh` prints the console URL and a `curl` smoke test at the end.
+Re-running it is safe — it checks for each resource before creating it — but
+it isn't fully idempotent under a partial failure; read what failed and
+re-run rather than expecting every state to self-heal.
+
+### Testing it
+
+Six checks, each exercising one more layer than the last, so a failure points
+at one place instead of "something in the pipeline." Set these once:
+
+```bash
+export AWS_REGION=us-east-1
+export CLUSTER=poc-agent-cluster
+API_BASE=https://<api-id>.execute-api.us-east-1.amazonaws.com   # setup.sh printed this
+CACHE_BUCKET=poc-agent-cache-$(aws sts get-caller-identity --query Account --output text)
+```
+
+**1. Infra sanity** — confirm setup.sh actually created everything before
+blaming the pipeline for a resource that was never there:
+
+```bash
+aws dynamodb describe-table --table-name poc-agent-runs --query Table.TableStatus
+aws dynamodb describe-table --table-name poc-agent-locks --query Table.TableStatus
+aws sqs get-queue-url --queue-name poc-agent-runs
+aws ecs describe-task-definition --task-definition poc-agent-run --query 'taskDefinition.status'
+aws lambda get-function --function-name poc-agent-api --query 'Configuration.State'
+aws lambda get-function --function-name poc-agent-dispatcher --query 'Configuration.State'
+aws lambda get-function --function-name poc-agent-publish --query 'Configuration.State'
+aws ssm get-parameter --name /poc/github-token-read >/dev/null && echo "read token: set"
+aws ssm get-parameter --name /poc/github-token-write >/dev/null && echo "write token: set"
+```
+
+**2. The Fargate task alone** — `ecs:RunTask` directly, bypassing the API and
+dispatcher entirely. This is the equivalent of the EC2 path's Step 5: it
+isolates the cache/lock/agent-loop layer from everything above it.
+
+```bash
+SUBNET_ID=$(aws ec2 describe-subnets --filters Name=default-for-az,Values=true \
+  --query 'Subnets[0].SubnetId' --output text)
+SG_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values=poc-agent-fargate \
+  --query 'SecurityGroups[0].GroupId' --output text)
+
+aws ecs run-task --cluster "$CLUSTER" --task-definition poc-agent-run --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
+  --overrides '{"containerOverrides":[{"name":"agent",
+    "command":["demo-service","POC-1","Remove the Profile item from the sidebar navigation"],
+    "environment":[{"name":"RUN_ID","value":"manual-test-1"},{"name":"DRY_RUN","value":"1"}]}]}'
+```
+
+`DRY_RUN=1` stops before the S3 handoff, same meaning as on EC2. Tail it:
+
+```bash
+aws logs tail /ecs/poc-agent-run --since 1m --follow
+```
+
+Expect to see the same phase markers as the EC2 path (`cache miss`/`cache
+hit`, `running agent`, `validating`, `PASS`/`FAIL` lines) plus, near the end,
+`PUBLISH_MODE=deferred — writing patch instead of pushing` and `DRY_RUN=1 —
+stopping before handoff`. If this step fails, the problem is in
+`agent/lib/{cache,lock}.sh`, the task's IAM role, or networking — not in
+anything Lambda.
+
+**3. One real run through the whole pipeline** — same call
+`scripts/parallel-smoke.sh` already knows how to make, so use it for the
+capacity check before you even queue anything:
+
+```bash
+curl -s "$API_BASE/api/capacity"
+
+RUN_ID=$(curl -s -X POST "$API_BASE/api/runs" -H 'content-type: application/json' \
+  -d '{"repo":"demo-service","ticket":"POC-1","task":"Remove the Profile item from the sidebar navigation"}' \
+  | jq -r .id)
+echo "run: $RUN_ID"
+
+watch -n2 "curl -s $API_BASE/api/runs/$RUN_ID | jq '{state,phase,checks,prUrl}'"
+```
+
+Expected state sequence: `queued` → `starting` → `coding` → `validating` →
+`awaiting_publish` → `passed` (the last transition is `lambda/publish`, not
+the Fargate task — see check 5). Confirm each hop against its own source
+instead of only trusting the aggregate state:
+
+```bash
+# 3a. did the dispatcher actually launch a task and record it?
+aws dynamodb get-item --table-name poc-agent-runs --key "{\"id\":{\"S\":\"$RUN_ID\"}}" \
+  --query 'Item.{taskArn:taskArn,logStream:logStream}'
+
+# 3b. the task's own log, same as check 2
+aws logs tail /ecs/poc-agent-run --since 5m --filter-pattern "$RUN_ID" 2>/dev/null \
+  || curl -s "$API_BASE/api/runs/$RUN_ID/log"
+
+# 3c. did the patch actually land in S3?
+aws s3 ls "s3://$CACHE_BUCKET/runs/$RUN_ID/"
+```
+
+**4. Publish alone** — once a run is sitting at `awaiting_publish` (or replay
+one that already finished — `lambda/publish` re-reads the same S3 objects),
+confirm the EventBridge → publish leg fired without waiting on step 3's timing:
+
+```bash
+aws logs tail /aws/lambda/poc-agent-publish --since 10m
+aws events list-targets-by-rule --rule poc-agent-task-stopped
+```
+
+If the run sits at `awaiting_publish` indefinitely, the rule isn't matching —
+check `detail.group` on the actual ECS task-stopped event
+(`aws ecs describe-tasks --cluster "$CLUSTER" --tasks <taskArn> --query 'tasks[0].group'`
+should read `family:poc-agent-run`) rather than assuming the Lambda itself is
+broken.
+
+**5. The IAM boundary is real, not just a comment** — the point of
+`PUBLISH_MODE=deferred` is that the task role *cannot* push even if it tried.
+Verify it directly instead of trusting the policy JSON by inspection:
+
+```bash
+aws iam simulate-principal-policy \
+  --policy-source-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/poc-agent-task-role \
+  --action-names ssm:GetParameter \
+  --resource-arns "arn:aws:ssm:${AWS_REGION}:$(aws sts get-caller-identity --query Account --output text):parameter/poc/github-token-write" \
+  --query 'EvaluationResults[0].EvalDecision'
+```
+
+Expect `implicitDeny`. If this ever comes back `allowed`, stop — that's the
+guardrail failing, not a test failing.
+
+**6. A deliberately failing run** — same as the EC2 demo script's opening
+beat. Point it at a task you know breaks a check (or a nonexistent function
+name) and confirm the pipeline stops cleanly:
+
+```bash
+curl -s -X POST "$API_BASE/api/runs" -H 'content-type: application/json' \
+  -d '{"repo":"demo-service","ticket":"POC-2","task":"Rename a function that does not exist to force a lint failure"}'
+```
+
+Expect state to land on `failed`, no `prUrl`, nothing in
+`s3://$CACHE_BUCKET/runs/<id>/`, and no invocation of `lambda/publish` at all
+(check 4's log tail should show nothing for this run — `report_failed` in
+`agent/lib/report.sh` sets state before the deferred handoff is ever reached,
+so publish never gets an `awaiting_publish` item to act on).
+
+**7. Parallel + the console** — `scripts/parallel-smoke.sh` talks only to
+`/api/capacity`, `/api/runs` and `/api/runs/:id/log`, all of which
+`lambda/api` implements with the same shapes, so it runs unchanged:
+
+```bash
+CONSOLE="$API_BASE" ./scripts/parallel-smoke.sh demo-service demo-web
+```
+
+Same assertions as the EC2 path (one clone per repo, one branch and worktree
+per run). Then open the console URL `deploy-console.sh` printed and submit a
+run by hand — confirm the sidebar's phase/checks update roughly once a
+second (it's polling now, not streaming, so expect a ~1s lag, not the EC2
+path's push-the-instant-it-happens feel) and that the PR link appears only
+once state reaches `passed`.
+
+### Rerunning after a change
+
+- Changed `agent/`, `agent/Dockerfile`, or anything `agent/lib/`: `./build-images.sh <account-id>` (rebuilds and pushes `poc-agent`, and the task definition already points at `:latest`, so the next `RunTask` picks it up — no re-registration needed).
+- Changed `lambda/api` or `lambda/dispatcher`: `./build-lambda-zips.sh` then re-run `setup.sh` (it always calls `update-function-code`).
+- Changed `lambda/publish`: `./build-images.sh <account-id>` then re-run `setup.sh`.
+- Changed `server/public/index.html`: `./deploy-console.sh <site-bucket> <api-base>`.
+
 ## Guardrails already in place
 
 | Guardrail | Where |
@@ -299,6 +551,7 @@ appears only when all four pass.
 | Token never persisted in the cache | Mirror remotes are token-free; auth via a 0600 credential file in the container |
 | Concurrency ceiling | `MAX_CONCURRENT`, default 2 — the rest queue |
 | Per-repo git lock | `flock` with `LOCK_TIMEOUT`, default 900s |
+| **Serverless path only:** the guardrail as an IAM boundary, not just a blocklist | `PUBLISH_MODE=deferred` — the Fargate task's role has no GitHub credential capable of writing at all; only `lambda/publish`'s separate role can reach the write-scoped token |
 
 ## What to show in the demo
 
@@ -324,6 +577,12 @@ Open with the gate, not a success.
 
 Set a billing alarm before your first run. An agent in a retry loop spends real
 money, which is what `MAX_ITERATIONS` and `MAX_TOKENS_TOTAL` are for.
+
+The serverless path's compute bill is a small fraction of this at POC volume —
+often under $5/month — because nothing is running between runs. See
+`docs/lambda-migration.md` §7 for the full breakdown, including the traps
+(provisioned concurrency, a NAT gateway, EFS) that quietly recreate the
+always-on instance's cost if you're not deliberate about avoiding them.
 
 ## Known gotchas
 

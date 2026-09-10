@@ -137,11 +137,21 @@
   <pre id="log"><span class="empty">Waiting for a run.</span></pre>
 </main>
 
+<!--
+  config.js defines window.API_BASE. On EC2/local it's absent and defaults to
+  '' (same origin — the Express server serves both the API and this page).
+  On the serverless path this page is a static S3/CloudFront site and the API
+  is a separate API Gateway origin, so infra/fargate/deploy-console.sh writes
+  a config.js pointing at it. See docs/lambda-migration.md §4.5.
+-->
+<script src="config.js"></script>
 <script>
+const API_BASE = window.API_BASE || '';
 const CHECKS = ['lint', 'typecheck', 'test', 'build'];
 const el = (id) => document.getElementById(id);
 const log = el('log');
 let timer = null;
+let pollTimer = null;
 
 function renderChecks(checks) {
   el('checks').innerHTML = CHECKS.map((name) => {
@@ -166,6 +176,7 @@ function append(line) {
 
 function applyState(run) {
   el('phase').textContent = run.phase;
+  el('phase').dataset.state = run.state;
   el('runId').textContent = `${run.repo} · ${run.ticket} · run ${run.id}`;
   renderChecks(run.checks);
 
@@ -192,7 +203,7 @@ el('form').addEventListener('submit', async (e) => {
 
   let run;
   try {
-    const res = await fetch('/api/runs', {
+    const res = await fetch(`${API_BASE}/api/runs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ repo: el('repo').value, ticket: el('ticket').value, task: el('task').value }),
@@ -212,25 +223,47 @@ el('form').addEventListener('submit', async (e) => {
     el('elapsed').textContent = Math.floor((Date.now() - t0) / 1000) + 's';
   }, 1000);
 
-  const es = new EventSource(`/api/runs/${run.id}/stream`);
-  es.onmessage = (msg) => {
-    const ev = JSON.parse(msg.data);
-    if (ev.type === 'line') append(ev.line);
-    else if (ev.type === 'state') applyState(ev.run);
-    else if (ev.type === 'done') {
-      es.close();
-      clearInterval(timer);
-      el('go').disabled = false;
-      el('go').textContent = 'Start run';
-    }
-  };
-  es.onerror = () => {
-    append('log stream disconnected');
-    es.close();
+  // Polling instead of the EC2 path's EventSource: there is no long-lived
+  // process here to hold an SSE connection open across a run that can last
+  // many minutes (docs/lambda-migration.md §4.5). getLog returns the whole
+  // log every time (it's a CloudWatch Logs read, not an in-memory buffer),
+  // so only the tail past what's already rendered is appended.
+  let seen = 0;
+  let stopped = false;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(pollTimer);
     clearInterval(timer);
     el('go').disabled = false;
     el('go').textContent = 'Start run';
   };
+
+  const poll = async () => {
+    try {
+      const [stateRes, logRes] = await Promise.all([
+        fetch(`${API_BASE}/api/runs/${run.id}`),
+        fetch(`${API_BASE}/api/runs/${run.id}/log`),
+      ]);
+      if (stateRes.ok) applyState(await stateRes.json());
+      if (logRes.ok) {
+        const full = await logRes.text();
+        if (full.length > seen) {
+          full.slice(seen).split('\n').filter(Boolean).forEach(append);
+          seen = full.length;
+        }
+      }
+    } catch (err) {
+      append('poll failed: ' + err.message);
+    }
+  };
+
+  await poll();
+  pollTimer = setInterval(async () => {
+    await poll();
+    const s = el('phase').dataset.state;
+    if (['passed', 'failed', 'error'].includes(s)) stop();
+  }, 1000);
 });
 
 renderChecks(null);

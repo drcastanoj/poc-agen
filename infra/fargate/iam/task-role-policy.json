@@ -1,0 +1,41 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InvokeClaudeOnBedrock",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      "Resource": [
+        "arn:aws:bedrock:*::foundation-model/anthropic.*",
+        "arn:aws:bedrock:*:*:inference-profile/*anthropic*"
+      ]
+    },
+    {
+      "Sid": "RepoAndDepsCache",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": [
+        "arn:aws:s3:::REPLACE_WITH_CACHE_BUCKET/repos/*",
+        "arn:aws:s3:::REPLACE_WITH_CACHE_BUCKET/deps/*"
+      ]
+    },
+    {
+      "Sid": "WritePatchHandoffOnly",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::REPLACE_WITH_CACHE_BUCKET/runs/*"
+    },
+    {
+      "Sid": "PerRepoLock",
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:DeleteItem"],
+      "Resource": "arn:aws:dynamodb:*:*:table/poc-agent-locks"
+    },
+    {
+      "Sid": "ReportRunStatus",
+      "Effect": "Allow",
+      "Action": "dynamodb:UpdateItem",
+      "Resource": "arn:aws:dynamodb:*:*:table/poc-agent-runs"
+    }
+  ]
+}
